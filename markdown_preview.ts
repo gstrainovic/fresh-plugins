@@ -145,12 +145,11 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
     state.processHandle = null;
   }
 
-  // Use a wide width so glow doesn't wrap text mid-span (which breaks ANSI
-  // bold/italic sequences). The virtual buffer's lineWrap handles visual wrapping.
-  // We strip trailing spaces after parsing to remove glow's heading padding.
+  // Disable glow's word-wrap (-w 0) so it never breaks ANSI spans mid-line.
+  // The virtual buffer's lineWrap handles visual wrapping instead.
   state.processHandle = editor.spawnProcess(
     'glow',
-    ['-s', 'dark', '-w', '200', info.path],
+    ['-s', 'dark', '-w', '0', info.path],
   );
 
   try {
@@ -208,63 +207,7 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
         removedFromLine += 1;
       }
 
-      // 3. Compact table cells (glow pads each cell to -w/columns width)
-      const isTableLine = line.split('│').length >= 3 || line.split('┼').length >= 3;
-      if (isTableLine) {
-        let newLine = '';
-        let pos = 0;
-
-        // Preserve leading indent
-        while (pos < line.length && line[pos] === ' ') {
-          newLine += ' ';
-          pos++;
-        }
-
-        while (pos < line.length) {
-          const ch = line[pos];
-
-          if (ch === ' ') {
-            const spaceStart = pos;
-            while (pos < line.length && line[pos] === ' ') pos++;
-            const spaceCount = pos - spaceStart;
-            const isTrailing = pos >= line.length;
-
-            if (isTrailing) {
-              // Remove all trailing spaces
-              adjustments.push({ origStart: lineStart + spaceStart, removed: spaceCount });
-              removedFromLine += spaceCount;
-            } else if (spaceCount > 1) {
-              // Keep 1 space, remove rest
-              newLine += ' ';
-              adjustments.push({ origStart: lineStart + spaceStart + 1, removed: spaceCount - 1 });
-              removedFromLine += spaceCount - 1;
-            } else {
-              newLine += ' ';
-            }
-          } else if (ch === '─') {
-            const dashStart = pos;
-            while (pos < line.length && line[pos] === '─') pos++;
-            const dashCount = pos - dashStart;
-            const targetDashes = 8;
-
-            if (dashCount > targetDashes) {
-              const removeCount = dashCount - targetDashes;
-              adjustments.push({ origStart: lineStart + dashStart + targetDashes, removed: removeCount });
-              removedFromLine += removeCount;
-              newLine += '─'.repeat(targetDashes);
-            } else {
-              newLine += '─'.repeat(dashCount);
-            }
-          } else {
-            newLine += ch;
-            pos++;
-          }
-        }
-
-        line = newLine;
-      }
-
-      // 4. Strip trailing whitespace (table lines already handled above)
+      // 3. Strip trailing whitespace
       const trimmed = line.trimEnd();
       const trailingSpaces = line.length - trimmed.length;
       if (trailingSpaces > 0) {
