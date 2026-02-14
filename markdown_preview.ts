@@ -35,6 +35,22 @@ function charToByteOffset(text: string, charOffset: number): number {
   return bytes;
 }
 
+// Convert 256-color index to RGB
+function color256ToRgb(n: number): [number, number, number] | null {
+  if (n < 0 || n > 255) return null;
+  if (n < 8) return ANSI_COLORS[n + 30] || null;
+  if (n < 16) return ANSI_COLORS[n - 8 + 90] || null;
+  if (n < 232) {
+    const idx = n - 16;
+    const r = Math.floor(idx / 36);
+    const g = Math.floor((idx % 36) / 6);
+    const b = idx % 6;
+    return [r ? r * 40 + 55 : 0, g ? g * 40 + 55 : 0, b ? b * 40 + 55 : 0];
+  }
+  const gray = (n - 232) * 10 + 8;
+  return [gray, gray, gray];
+}
+
 // ANSI color/style parsing
 interface AnsiSpan {
   text: string;
@@ -96,7 +112,8 @@ function parseAnsi(raw: string): AnsiSpan[] {
         else if (p >= 90 && p <= 97) fg = ANSI_COLORS[p] || null;
         else if (p === 39) fg = null;
         else if (p === 38 && params[i + 1] === 5 && params[i + 2] !== undefined) {
-          // 256-color: \e[38;5;Nm - skip for now, use default
+          // 256-color: \e[38;5;Nm
+          fg = color256ToRgb(params[i + 2]);
           i += 2;
         }
         else if (p === 38 && params[i + 1] === 2 && params.length >= i + 5) {
@@ -163,9 +180,8 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
       }
     }
 
-    // Post-process: strip heading markers and trailing whitespace while keeping
-    // overlay offsets in sync. glow pads headings to fill the full -w width with
-    // spaces, which bloats the virtual buffer when lineWrap is enabled.
+    // Post-process: strip heading markers, fix H1 indent, compact tables, and
+    // remove trailing whitespace — while keeping overlay offsets in sync.
     const rawLines = plainText.split('\n');
     let trimmedText = '';
     let originalPos = 0;
@@ -174,23 +190,85 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
     for (let i = 0; i < rawLines.length; i++) {
       let line = rawLines[i];
       const lineStart = originalPos;
+      let removedFromLine = 0;
 
-      // Strip heading markers (##, ###, etc.)
+      // 1. Strip heading markers (H2-H6: ##, ###, etc.)
       const headingMatch = line.match(/^(  )#{2,6} /);
       if (headingMatch) {
         const markerLen = headingMatch[0].length - headingMatch[1].length;
-        const removeStart = lineStart + headingMatch[1].length;
-        adjustments.push({ origStart: removeStart, removed: markerLen });
+        adjustments.push({ origStart: lineStart + headingMatch[1].length, removed: markerLen });
         line = headingMatch[1] + line.slice(headingMatch[0].length);
+        removedFromLine += markerLen;
       }
 
-      // Strip trailing whitespace — origStart must refer to the ORIGINAL plainText position.
-      // After heading marker stripping, `line` is shorter, so add back the marker length.
-      const markerLen = headingMatch ? (headingMatch[0].length - headingMatch[1].length) : 0;
+      // 2. Fix H1 indent — glow adds a decorative bold space making 3 leading spaces instead of 2
+      if (!headingMatch && line.startsWith('   ') && !line.startsWith('    ')) {
+        adjustments.push({ origStart: lineStart + 2, removed: 1 });
+        line = '  ' + line.slice(3);
+        removedFromLine += 1;
+      }
+
+      // 3. Compact table cells (glow pads each cell to -w/columns width)
+      const isTableLine = line.split('│').length >= 3 || line.split('┼').length >= 3;
+      if (isTableLine) {
+        let newLine = '';
+        let pos = 0;
+
+        // Preserve leading indent
+        while (pos < line.length && line[pos] === ' ') {
+          newLine += ' ';
+          pos++;
+        }
+
+        while (pos < line.length) {
+          const ch = line[pos];
+
+          if (ch === ' ') {
+            const spaceStart = pos;
+            while (pos < line.length && line[pos] === ' ') pos++;
+            const spaceCount = pos - spaceStart;
+            const isTrailing = pos >= line.length;
+
+            if (isTrailing) {
+              // Remove all trailing spaces
+              adjustments.push({ origStart: lineStart + spaceStart, removed: spaceCount });
+              removedFromLine += spaceCount;
+            } else if (spaceCount > 1) {
+              // Keep 1 space, remove rest
+              newLine += ' ';
+              adjustments.push({ origStart: lineStart + spaceStart + 1, removed: spaceCount - 1 });
+              removedFromLine += spaceCount - 1;
+            } else {
+              newLine += ' ';
+            }
+          } else if (ch === '─') {
+            const dashStart = pos;
+            while (pos < line.length && line[pos] === '─') pos++;
+            const dashCount = pos - dashStart;
+            const targetDashes = 8;
+
+            if (dashCount > targetDashes) {
+              const removeCount = dashCount - targetDashes;
+              adjustments.push({ origStart: lineStart + dashStart + targetDashes, removed: removeCount });
+              removedFromLine += removeCount;
+              newLine += '─'.repeat(targetDashes);
+            } else {
+              newLine += '─'.repeat(dashCount);
+            }
+          } else {
+            newLine += ch;
+            pos++;
+          }
+        }
+
+        line = newLine;
+      }
+
+      // 4. Strip trailing whitespace (table lines already handled above)
       const trimmed = line.trimEnd();
       const trailingSpaces = line.length - trimmed.length;
       if (trailingSpaces > 0) {
-        adjustments.push({ origStart: lineStart + line.length - trailingSpaces + markerLen, removed: trailingSpaces });
+        adjustments.push({ origStart: lineStart + line.length - trailingSpaces + removedFromLine, removed: trailingSpaces });
       }
 
       trimmedText += trimmed + (i < rawLines.length - 1 ? '\n' : '');
