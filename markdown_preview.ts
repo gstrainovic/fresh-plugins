@@ -110,14 +110,12 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
     state.processHandle = null;
   }
 
-  // Get viewport width for glow
-  const viewport = editor.getViewport();
-  const width = viewport ? Math.max(40, Math.floor(viewport.width / 2) - 4) : 80;
-
-  // Run glow on the file
+  // Use a wide width so glow doesn't wrap text mid-span (which breaks ANSI
+  // bold/italic sequences). The virtual buffer's lineWrap handles visual wrapping.
+  // We strip trailing spaces after parsing to remove glow's heading padding.
   state.processHandle = editor.spawnProcess(
     'glow',
-    ['-s', 'dark', '-w', String(width), info.path],
+    ['-s', 'dark', '-w', '200', info.path],
   );
 
   try {
@@ -147,9 +145,64 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
       }
     }
 
-    // Post-process: strip heading markers (##, ###, etc.) from rendered output
-    // glow keeps markers for H2+ but styles them with bold
-    plainText = plainText.replace(/^(  )#{2,6} /gm, '$1');
+    // Post-process: strip heading markers and trailing whitespace while keeping
+    // overlay offsets in sync. glow pads headings to fill the full -w width with
+    // spaces, which bloats the virtual buffer when lineWrap is enabled.
+    const rawLines = plainText.split('\n');
+    let trimmedText = '';
+    const offsetMap: number[] = []; // maps trimmed offset → original offset adjustment
+
+    let originalPos = 0;
+    let trimmedPos = 0;
+    const adjustments: { origStart: number; removed: number }[] = [];
+
+    for (let i = 0; i < rawLines.length; i++) {
+      let line = rawLines[i];
+      const lineStart = originalPos;
+
+      // Strip heading markers (##, ###, etc.)
+      const headingMatch = line.match(/^(  )#{2,6} /);
+      if (headingMatch) {
+        const markerLen = headingMatch[0].length - headingMatch[1].length;
+        const removeStart = lineStart + headingMatch[1].length;
+        adjustments.push({ origStart: removeStart, removed: markerLen });
+        line = headingMatch[1] + line.slice(headingMatch[0].length);
+      }
+
+      // Strip trailing whitespace
+      const trimmed = line.trimEnd();
+      const trailingSpaces = line.length - trimmed.length;
+      if (trailingSpaces > 0) {
+        adjustments.push({ origStart: lineStart + line.length - trailingSpaces, removed: trailingSpaces });
+      }
+
+      trimmedText += trimmed + (i < rawLines.length - 1 ? '\n' : '');
+      originalPos += rawLines[i].length + 1; // +1 for \n
+    }
+
+    // Adjust overlay offsets for all removals
+    for (const ov of overlays) {
+      let startAdj = 0;
+      let endAdj = 0;
+      for (const adj of adjustments) {
+        // Adjust start
+        if (ov.start > adj.origStart + adj.removed) {
+          startAdj += adj.removed;
+        } else if (ov.start > adj.origStart) {
+          startAdj += ov.start - adj.origStart;
+        }
+        // Adjust end
+        if (ov.end > adj.origStart + adj.removed) {
+          endAdj += adj.removed;
+        } else if (ov.end > adj.origStart) {
+          endAdj += ov.end - adj.origStart;
+        }
+      }
+      ov.start -= startAdj;
+      ov.end -= endAdj;
+    }
+
+    plainText = trimmedText;
 
     // Build entries for the virtual buffer
     const lines = plainText.split('\n');
