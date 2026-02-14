@@ -17,6 +17,24 @@ function isMarkdownFile(path: string): boolean {
   return ext === '.md' || ext === '.markdown' || ext === '.mkd' || ext === '.mdx';
 }
 
+// Convert JS string character offset to UTF-8 byte offset.
+// Fresh Editor uses byte offsets for all buffer positions (overlays, cursors, etc.).
+function charToByteOffset(text: string, charOffset: number): number {
+  let bytes = 0;
+  const limit = Math.min(charOffset, text.length);
+  for (let i = 0; i < limit; i++) {
+    const code = text.charCodeAt(i);
+    if (code <= 0x7F) bytes += 1;
+    else if (code <= 0x7FF) bytes += 2;
+    else if (code >= 0xD800 && code <= 0xDBFF) {
+      bytes += 4;
+      i++; // skip low surrogate
+    }
+    else bytes += 3;
+  }
+  return bytes;
+}
+
 // ANSI color/style parsing
 interface AnsiSpan {
   text: string;
@@ -150,10 +168,7 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
     // spaces, which bloats the virtual buffer when lineWrap is enabled.
     const rawLines = plainText.split('\n');
     let trimmedText = '';
-    const offsetMap: number[] = []; // maps trimmed offset → original offset adjustment
-
     let originalPos = 0;
-    let trimmedPos = 0;
     const adjustments: { origStart: number; removed: number }[] = [];
 
     for (let i = 0; i < rawLines.length; i++) {
@@ -169,11 +184,13 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
         line = headingMatch[1] + line.slice(headingMatch[0].length);
       }
 
-      // Strip trailing whitespace
+      // Strip trailing whitespace — origStart must refer to the ORIGINAL plainText position.
+      // After heading marker stripping, `line` is shorter, so add back the marker length.
+      const markerLen = headingMatch ? (headingMatch[0].length - headingMatch[1].length) : 0;
       const trimmed = line.trimEnd();
       const trailingSpaces = line.length - trimmed.length;
       if (trailingSpaces > 0) {
-        adjustments.push({ origStart: lineStart + line.length - trailingSpaces, removed: trailingSpaces });
+        adjustments.push({ origStart: lineStart + line.length - trailingSpaces + markerLen, removed: trailingSpaces });
       }
 
       trimmedText += trimmed + (i < rawLines.length - 1 ? '\n' : '');
@@ -222,7 +239,10 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
       if (ov.fg) opts['fg'] = ov.fg;
       if (ov.bold) opts['bold'] = true;
       if (ov.italic) opts['italic'] = true;
-      editor.addOverlay(state.previewBufferId, 'md-preview', ov.start, ov.end, opts);
+      // Fresh uses byte offsets for overlay positions, convert from char offsets
+      const byteStart = charToByteOffset(plainText, ov.start);
+      const byteEnd = charToByteOffset(plainText, ov.end);
+      editor.addOverlay(state.previewBufferId, 'md-preview', byteStart, byteEnd, opts);
     }
   } catch {
     // Process was killed (e.g., preview closed), ignore
