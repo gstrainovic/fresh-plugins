@@ -112,13 +112,21 @@ function parseAnsi(raw: string): AnsiSpan[] {
         else if (p >= 90 && p <= 97) fg = ANSI_COLORS[p] || null;
         else if (p === 39) fg = null;
         else if (p === 38 && params[i + 1] === 5 && params[i + 2] !== undefined) {
-          // 256-color: \e[38;5;Nm
+          // 256-color fg: \e[38;5;Nm
           fg = color256ToRgb(params[i + 2]);
           i += 2;
         }
         else if (p === 38 && params[i + 1] === 2 && params.length >= i + 5) {
-          // 24-bit: \e[38;2;R;G;Bm
+          // 24-bit fg: \e[38;2;R;G;Bm
           fg = [params[i + 2], params[i + 3], params[i + 4]];
+          i += 4;
+        }
+        else if (p === 48 && params[i + 1] === 5 && params[i + 2] !== undefined) {
+          // 256-color bg: skip to avoid misinterpreting color index as fg
+          i += 2;
+        }
+        else if (p === 48 && params[i + 1] === 2 && params.length >= i + 5) {
+          // 24-bit bg: skip
           i += 4;
         }
       }
@@ -147,9 +155,11 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
 
   // Disable glow's word-wrap (-w 0) so it never breaks ANSI spans mid-line.
   // The virtual buffer's lineWrap handles visual wrapping instead.
+  // Force color output (CLICOLOR_FORCE) so glow emits syntax highlighting
+  // for code blocks even though stdout is not a TTY.
   state.processHandle = editor.spawnProcess(
-    'glow',
-    ['-s', 'dark', '-w', '0', info.path],
+    'env',
+    ['CLICOLOR_FORCE=1', 'COLORTERM=truecolor', 'glow', '-s', 'dark', '-w', '0', info.path],
   );
 
   try {
