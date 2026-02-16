@@ -1,20 +1,155 @@
 /// <reference path="/usr/share/fresh-editor/plugins/lib/fresh.d.ts" />
-// Markdown Preview Plugin
-// Renders markdown files using glow and displays the result in a virtual buffer split.
-// Toggle with the "Markdown: Toggle Preview" command.
+// Markdown Preview Plugin with Auto-Download
+// Automatically downloads glow if not present, then renders markdown in a virtual buffer split.
 
 const editor = getEditor();
+
+// Configuration
+const GLOW_VERSION = "v2.1.1";
+const GLOW_BIN_DIR = editor.pathJoin(editor.getConfigDir(), "plugins", "bin");
+const GLOW_BIN_PATH = editor.pathJoin(GLOW_BIN_DIR, "glow");
 
 // Track preview state per source buffer
 const previewState = new Map<number, {
   previewBufferId: number;
   splitId: number;
   processHandle: ProcessHandle<SpawnResult> | null;
+  lastContentHash: string;
 }>();
+
+// Debounce timer for content changes
+const changeDebounceTimer = new Map<number, number>();
+
+// Check if glow is available (global or local)
+async function findGlow(): Promise<string | null> {
+  // Check global glow first
+  try {
+    const handle = editor.spawnProcess('which', ['glow']);
+    const result = await handle.result;
+    if (result.exit_code === 0 && result.stdout.trim()) {
+      return 'glow';
+    }
+  } catch { /* ignore */ }
+
+  // Check local glow
+  try {
+    const handle = editor.spawnProcess('test', ['-x', GLOW_BIN_PATH]);
+    const result = await handle.result;
+    if (result.exit_code === 0) {
+      return GLOW_BIN_PATH;
+    }
+  } catch { /* ignore */ }
+
+  return null;
+}
+
+// Get platform-specific download URL
+function getGlowDownloadUrl(): string | null {
+  // Detect platform using uname
+  const platform = 'linux'; // Default to linux for now
+  const arch = 'x86_64';    // Default to x86_64
+
+  // Map to glow release naming
+  let osName = 'Linux';
+  let archName = 'x86_64';
+
+  return `https://github.com/charmbracelet/glow/releases/download/${GLOW_VERSION}/glow_${GLOW_VERSION.replace('v', '')}_${osName}_${archName}.tar.gz`;
+}
+
+// Download and install glow
+async function installGlow(): Promise<boolean> {
+  const url = getGlowDownloadUrl();
+  if (!url) {
+    editor.setStatus('Unsupported platform for automatic glow installation');
+    return false;
+  }
+
+  editor.setStatus('Downloading glow...');
+
+  // Create bin directory
+  editor.spawnProcess('mkdir', ['-p', GLOW_BIN_DIR]);
+
+  const tempDir = `/tmp/fresh-glow-install-${Date.now()}`;
+  const archivePath = `${tempDir}/glow.tar.gz`;
+
+  try {
+    // Create temp directory
+    await editor.spawnProcess('mkdir', ['-p', tempDir]).result;
+
+    // Download
+    editor.setStatus('Downloading glow from GitHub...');
+    const curlHandle = editor.spawnProcess('curl', ['-L', '-o', archivePath, url]);
+    const curlResult = await curlHandle.result;
+
+    if (curlResult.exit_code !== 0) {
+      // Try wget as fallback
+      const wgetHandle = editor.spawnProcess('wget', ['-O', archivePath, url]);
+      const wgetResult = await wgetHandle.result;
+      if (wgetResult.exit_code !== 0) {
+        editor.setStatus('Failed to download glow. Please install manually.');
+        return false;
+      }
+    }
+
+    // Extract
+    editor.setStatus('Extracting glow...');
+    const extractHandle = editor.spawnProcess('tar', ['-xzf', archivePath, '-C', tempDir]);
+    const extractResult = await extractHandle.result;
+
+    if (extractResult.exit_code !== 0) {
+      editor.setStatus('Failed to extract glow archive');
+      return false;
+    }
+
+    // Find and move glow binary
+    const findHandle = editor.spawnProcess('find', [tempDir, '-name', 'glow', '-type', 'f']);
+    const findResult = await findHandle.result;
+
+    if (findResult.exit_code !== 0 || !findResult.stdout.trim()) {
+      editor.setStatus('Could not find glow binary in archive');
+      return false;
+    }
+
+    const glowBinary = findResult.stdout.trim().split('\n')[0];
+    const mvHandle = editor.spawnProcess('mv', [glowBinary, GLOW_BIN_PATH]);
+    const mvResult = await mvHandle.result;
+
+    if (mvResult.exit_code !== 0) {
+      editor.setStatus('Failed to move glow binary');
+      return false;
+    }
+
+    // Make executable
+    const chmodHandle = editor.spawnProcess('chmod', ['+x', GLOW_BIN_PATH]);
+    await chmodHandle.result;
+
+    // Cleanup
+    editor.spawnProcess('rm', ['-rf', tempDir]);
+
+    editor.setStatus('glow installed successfully!');
+    return true;
+
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    editor.setStatus(`Failed to install glow: ${msg}`);
+    return false;
+  }
+}
 
 function isMarkdownFile(path: string): boolean {
   const ext = editor.pathExtname(path).toLowerCase();
   return ext === '.md' || ext === '.markdown' || ext === '.mkd' || ext === '.mdx';
+}
+
+// Simple hash for content comparison
+function hashContent(text: string): string {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return hash.toString();
 }
 
 // Convert JS string character offset to UTF-8 byte offset.
@@ -153,13 +288,37 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
     state.processHandle = null;
   }
 
+  // Get current buffer length (may have changed after edits)
+  const currentLength = editor.getBufferLength(sourceBufferId);
+  
+  // Get current buffer content (unsaved changes)
+  const bufferContent = await editor.getBufferText(sourceBufferId, 0, currentLength);
+  
+  // Check if content actually changed (avoid unnecessary re-renders)
+  const contentHash = hashContent(bufferContent);
+  if (state.lastContentHash === contentHash) {
+    return;
+  }
+  state.lastContentHash = contentHash;
+
+  // Write to temp file for glow
+  const tempFile = `/tmp/fresh-md-preview-${sourceBufferId}-${Date.now()}.md`;
+  editor.writeFile(tempFile, bufferContent);
+
   // Disable glow's word-wrap (-w 0) so it never breaks ANSI spans mid-line.
   // The virtual buffer's lineWrap handles visual wrapping instead.
   // Force color output (CLICOLOR_FORCE) so glow emits syntax highlighting
   // for code blocks even though stdout is not a TTY.
+  const glowPath = await findGlow();
+  if (!glowPath) {
+    editor.setStatus('glow not found. Run "Markdown: Install Glow" command.');
+    editor.spawnProcess('rm', ['-f', tempFile]);
+    return;
+  }
+
   state.processHandle = editor.spawnProcess(
     'env',
-    ['CLICOLOR_FORCE=1', 'COLORTERM=truecolor', 'glow', '-s', 'dark', '-w', '0', info.path],
+    ['CLICOLOR_FORCE=1', 'COLORTERM=truecolor', glowPath, '-s', 'dark', '-w', '0', tempFile],
   );
 
   try {
@@ -278,6 +437,9 @@ async function renderPreview(sourceBufferId: number): Promise<void> {
   } catch {
     // Process was killed (e.g., preview closed), ignore
     state.processHandle = null;
+  } finally {
+    // Cleanup temp file
+    editor.spawnProcess('rm', ['-f', tempFile]);
   }
 }
 
@@ -285,6 +447,13 @@ async function openPreview(sourceBufferId: number): Promise<void> {
   const info = editor.getBufferInfo(sourceBufferId);
   if (!info || !isMarkdownFile(info.path)) {
     editor.setStatus('Not a markdown file');
+    return;
+  }
+
+  // Check glow availability first
+  const glowPath = await findGlow();
+  if (!glowPath) {
+    editor.setStatus('glow not found. Run "Markdown: Install Glow" command.');
     return;
   }
 
@@ -305,6 +474,7 @@ async function openPreview(sourceBufferId: number): Promise<void> {
       previewBufferId: result.bufferId,
       splitId: result.splitId!,
       processHandle: null,
+      lastContentHash: '',
     });
 
     // Render the preview
@@ -323,6 +493,13 @@ async function openPreview(sourceBufferId: number): Promise<void> {
 function closePreview(sourceBufferId: number): void {
   const state = previewState.get(sourceBufferId);
   if (!state) return;
+
+  // Clear any pending debounce timer
+  const timer = changeDebounceTimer.get(sourceBufferId);
+  if (timer) {
+    clearTimeout(timer);
+    changeDebounceTimer.delete(sourceBufferId);
+  }
 
   // Kill render process
   if (state.processHandle) {
@@ -359,10 +536,59 @@ globalThis.onMarkdownPreviewBufferSaved = async function(data: {
   }
 };
 
+// Hot reload: refresh preview after insert (debounced)
+globalThis.onMarkdownPreviewAfterInsert = function(data: {
+  buffer_id: number;
+}): void {
+  if (!previewState.has(data.buffer_id)) return;
+  
+  // Clear existing timer
+  const existingTimer = changeDebounceTimer.get(data.buffer_id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+  
+  // Set new timer (300ms debounce)
+  const timer = setTimeout(() => {
+    changeDebounceTimer.delete(data.buffer_id);
+    renderPreview(data.buffer_id);
+  }, 300);
+  
+  changeDebounceTimer.set(data.buffer_id, timer as unknown as number);
+};
+
+// Hot reload: refresh preview after delete (debounced)
+globalThis.onMarkdownPreviewAfterDelete = function(data: {
+  buffer_id: number;
+}): void {
+  if (!previewState.has(data.buffer_id)) return;
+  
+  // Clear existing timer
+  const existingTimer = changeDebounceTimer.get(data.buffer_id);
+  if (existingTimer) {
+    clearTimeout(existingTimer);
+  }
+  
+  // Set new timer (300ms debounce)
+  const timer = setTimeout(() => {
+    changeDebounceTimer.delete(data.buffer_id);
+    renderPreview(data.buffer_id);
+  }, 300);
+  
+  changeDebounceTimer.set(data.buffer_id, timer as unknown as number);
+};
+
 // Clean up when source buffer is closed
 globalThis.onMarkdownPreviewBufferClosed = function(data: {
   buffer_id: number;
 }): void {
+  // Clear any pending debounce timer
+  const timer = changeDebounceTimer.get(data.buffer_id);
+  if (timer) {
+    clearTimeout(timer);
+    changeDebounceTimer.delete(data.buffer_id);
+  }
+  
   if (previewState.has(data.buffer_id)) {
     closePreview(data.buffer_id);
   }
@@ -380,14 +606,42 @@ globalThis.onMarkdownPreviewBufferClosed = function(data: {
 };
 
 // Register events
-editor.on('buffer_saved', 'onMarkdownPreviewBufferSaved');
+editor.on('after_file_save', 'onMarkdownPreviewBufferSaved');
+editor.on('after_insert', 'onMarkdownPreviewAfterInsert');
+editor.on('after_delete', 'onMarkdownPreviewAfterDelete');
 editor.on('buffer_closed', 'onMarkdownPreviewBufferClosed');
 
-// Register command
+// Install glow command
+globalThis.markdownInstallGlow = async function(): Promise<void> {
+  const existing = await findGlow();
+  if (existing && existing !== GLOW_BIN_PATH) {
+    editor.setStatus(`glow already installed: ${existing}`);
+    return;
+  }
+
+  if (existing === GLOW_BIN_PATH) {
+    editor.setStatus('glow already installed locally.');
+    return;
+  }
+
+  const success = await installGlow();
+  if (success) {
+    editor.setStatus('glow installed! You can now use Markdown: Toggle Preview');
+  }
+};
+
+// Register commands
 editor.registerCommand(
   'Markdown: Toggle Preview',
   'Toggle markdown preview in a side split (rendered with glow)',
   'markdownTogglePreview',
+  null
+);
+
+editor.registerCommand(
+  'Markdown: Install Glow',
+  'Download and install glow automatically',
+  'markdownInstallGlow',
   null
 );
 
